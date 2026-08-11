@@ -86,6 +86,14 @@ The project demonstration videos are available here:
 - Sensor Interfacing
 
 ---
+## Research Publication
+
+This project was presented as a research paper at the **5th International Conference on Advances in Science, Engineering & Technology (ICASET 2026)**.
+
+**Paper Title:**
+Automated Embedded System for Grocery Vending Machine
+
+---
 
 ## My Contribution
 
