@@ -63,6 +63,14 @@ The Smart Grocery Vending Machine is an embedded system designed to automate the
 ![Prototype](Prototype.jpg)
 
 ---
+## 🎥 Project Demonstration
+
+The project demonstration videos are available here:
+
+- [Demo Videos](Demo_Videos.md)
+
+
+---
 
 ## Technologies Used
 
