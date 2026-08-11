@@ -1,0 +1,838 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <EEPROM.h>
+#include <HardwareSerial.h>
+
+bool gsmReady = false;   // global
+
+/* -------- GSM -------- */
+#define GSM_TX 26
+#define GSM_RX 27
+
+HardwareSerial gsm(2);
+
+/* -------- Customer Phone Numbers -------- */
+const char* KEERTHANA_NUMBER  = "+917305599400";
+const char* KISHORE_NUMBER  = "+917708184285";
+const char* KARTHIK_NUMBER = "+918072951643";
+
+/* -------- RFID Pins -------- */
+#define SS_PIN   5 
+
+#define RST_PIN  22
+
+/* -------- UART1 Pins -------- */
+#define UART1_TX 17
+#define UART1_RX 16
+
+#define EEPROM_SIZE 1024   // safe size
+
+// -------- EEPROM Layout --------
+#define ADDR_BAL_KEERTHANA  0
+#define ADDR_BAL_KISHORE    4
+#define ADDR_BAL_KARTHIK    8
+
+#define ADDR_RICE_TOTAL     12
+#define ADDR_DALL_TOTAL     16
+#define ADDR_SUGAR_TOTAL    20
+
+#define ADDR_RICE_REMAIN    24
+#define ADDR_DALL_REMAIN    28
+#define ADDR_SUGAR_REMAIN   32
+
+#define ADDR_RICE_PRICE     36
+#define ADDR_DALL_PRICE     40
+#define ADDR_SUGAR_PRICE    44
+
+#define ADDR_HISTORY_HEAD   48
+#define ADDR_HISTORY_COUNT  52
+#define ADDR_HISTORY_BASE   60
+#define HISTORY_RECORD_SIZE sizeof(Purchase)
+
+int Timeout = 120000;  //2 minutes
+
+/* -------- Access Point Credentials -------- */
+const char* ap_ssid = "ESP32_VENDING";
+const char* ap_password = "12345678";
+
+/* -------- Login Passwords -------- */
+const String ADMIN_LOGIN = "admin123";
+const String USER1_LOGIN = "karthi123";
+const String USER2_LOGIN = "keerthana123";
+const String USER3_LOGIN = "kishore123";
+
+/* -------- Objects -------- */
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+WebServer server(80);
+
+/* -------- Variables -------- */
+String uidString = "";
+String customerName = "";
+String rxData = "";
+String item = "";
+String quantity = "";
+
+
+/* -------- PRICE (₹ per gram) -------- */
+float ricePrice  = 0.05;
+float dallPrice  = 0.08;
+float sugarPrice = 0.06;
+
+/* -------- Tracking -------- */
+float totalRiceSold = 0;
+float totalDallSold = 0;
+float totalSugarSold = 0;
+
+/* -------- Inventory -------- */
+int riceStockTotal = 0, dallStockTotal = 0, sugarStockTotal = 0;
+int riceStockRemaining = 0, dallStockRemaining = 0, sugarStockRemaining = 0;
+
+/* -------- Wallet -------- */
+float balanceKEERTHANA = 0;
+float balanceKISHORE = 0;
+float balanceKARTHIK = 0;
+
+/* -------- Purchase History -------- */
+struct Purchase {
+  char user[10];   // "KEERTHANA", "KISHORE", "KARTHIK"
+  char item[10];   // "RICE", "DALL", "SUGAR"
+  int qty;
+};
+
+#define MAX_HISTORY 20
+Purchase history[MAX_HISTORY];
+int historyCount = 0;
+int historyHead = 0;   // FIFO pointer
+
+/* -------- Helper Function -------- */
+String cleanString(String data)
+{
+  data.trim();
+  String clean = "";
+
+  for (int i = 0; i < data.length(); i++)
+  {
+    if (isAlphaNumeric(data[i]) || data[i] == ',')
+      clean += data[i];
+  }
+
+  return clean;
+}
+
+
+/* -------- Pages -------- */
+String loginPage() {
+  String h = "<!DOCTYPE html><html><head>";
+  h += "<meta charset='UTF-8'>";
+  h += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  h += "<style>";
+
+  h += "body{margin:0;font-family:Arial;background:linear-gradient(135deg,#1d4ed8,#60a5fa);height:100vh;display:flex;align-items:center;justify-content:center;}";
+
+  h += ".card{background:white;padding:30px;border-radius:16px;width:90%;max-width:350px;box-shadow:0 10px 30px rgba(0,0,0,0.2);text-align:center;}";
+
+  h += "h2{margin-bottom:20px;}";
+
+  h += "input{width:100%;padding:12px;border-radius:10px;border:1px solid #ddd;margin-bottom:15px;font-size:16px;}";
+
+  h += "button{width:100%;padding:12px;border:none;border-radius:10px;background:#2563eb;color:white;font-size:16px;font-weight:bold;}";
+
+  h += ".logo{font-size:40px;margin-bottom:10px;}";
+
+  h += "</style></head><body>";
+
+  h += "<div class='card'>";
+  h += "<div class='logo'>🛒</div>";
+  h += "<h2>Smart Vending System</h2>";
+
+  h += "<form action='/login' method='POST'>";
+  h += "<input type='password' name='password' placeholder='Enter Password'>";
+  h += "<button>Login</button>";
+  h += "</form>";
+
+  h += "</div></body></html>";
+
+  return h;
+}
+
+String adminPage() {
+String h = "<!DOCTYPE html><html><head>";
+h += "<meta charset='UTF-8'>";
+h += "<meta name='viewport' content='width=device-width, initial-scale=1'>";  h += "<style>";
+  h += "body{margin:0;font-family:Arial,Helvetica;background:#f4f7fb;color:#222;}";
+  h += ".app{max-width:900px;margin:auto;padding:16px;}";
+  h += "h2{margin:0 0 12px 0;}";
+  h += ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;}";
+  h += ".card{background:#ffffff;border-radius:14px;padding:14px;box-shadow:0 6px 20px rgba(0,0,0,0.08);}";
+  h += ".user{padding:12px;border-radius:12px;color:#fff;}";
+  h += ".keerthana{background:linear-gradient(135deg,#3b82f6,#93c5fd);}";
+  h += ".kishore{background:linear-gradient(135deg,#22c55e,#86efac);}";
+  h += ".karthik{background:linear-gradient(135deg,#fb923c,#fed7aa);}";
+  h += ".label{font-size:13px;opacity:.9;}";
+  h += ".amount{font-size:26px;font-weight:bold;margin-top:4px;}";
+  h += ".stock{background:linear-gradient(135deg,#111827,#374151);color:#fff;}";
+  h += "input{width:100%;padding:8px;border-radius:8px;border:1px solid #ddd;margin-top:6px;}";
+  h += "button{margin-top:10px;width:100%;padding:10px;border:none;border-radius:10px;background:#2563eb;color:white;font-weight:600;}";
+  h += ".section{margin-top:16px;}";
+  h += ".history{font-size:13px;line-height:1.6;}";
+  h += "</style></head><body>";
+
+  h += "<div class='app'>";
+  h += "<h2>Admin Dashboard</h2>";
+
+  h += "<div class='grid'>";
+  h += "<div class='card user keerthana'><div class='label'>KEERTHANA Balance</div><div class='amount'>₹" + String(balanceKEERTHANA, 2) + "</div></div>";
+  h += "<div class='card user kishore'><div class='label'>KISHORE Balance</div><div class='amount'>₹" + String(balanceKISHORE, 2) + "</div></div>";
+  h += "<div class='card user karthik'><div class='label'>KARTHIK Balance</div><div class='amount'>₹" + String(balanceKARTHIK, 2) + "</div></div>";
+  h += "</div>";
+
+  h += "<div class='grid section'>";
+  h += "<div class='card stock'><div class='label'>Rice Remaining</div><div class='amount'>" + String(riceStockRemaining) + " g</div></div>";
+  h += "<div class='card stock'><div class='label'>Dall Remaining</div><div class='amount'>" + String(dallStockRemaining) + " g</div></div>";
+  h += "<div class='card stock'><div class='label'>Sugar Remaining</div><div class='amount'>" + String(sugarStockRemaining) + " g</div></div>";
+  h += "</div>";
+
+  h += "<div class='card section'><h3>Update Wallet Balance</h3><form action='/wallet' method='POST'>";
+  h += "KEERTHANA <input name='keerthana' value='" + String(balanceKEERTHANA, 2) + "'>";
+  h += "KISHORE <input name='kishore' value='" + String(balanceKISHORE, 2) + "'>";
+  h += "KARTHIK <input name='karthik' value='" + String(balanceKARTHIK, 2) + "'>";
+  h += "<button>Save Wallet</button></form></div>";
+
+  h += "<div class='card section'><h3>Inventory (Total Stock)</h3><form action='/stock' method='POST'>";
+  h += "Rice <input name='riceStock' value='" + String(riceStockTotal) + "'>";
+  h += "Dall <input name='dallStock' value='" + String(dallStockTotal) + "'>";
+  h += "Sugar <input name='sugarStock' value='" + String(sugarStockTotal) + "'>";
+  h += "<button>Update Stock</button></form></div>";
+
+  h += "<div class='card section'><h3>Prices (₹ per gram)</h3><form action='/update' method='POST'>";
+  h += "Rice <input name='rice' value='" + String(ricePrice) + "'>";
+  h += "Dall <input name='dall' value='" + String(dallPrice) + "'>";
+  h += "Sugar <input name='sugar' value='" + String(sugarPrice) + "'>";
+  h += "<button>Update Price</button></form></div>";
+
+  h += "<div class='card section'><h3>Recent Purchases</h3><div class='history'>";
+  for (int i = 0; i < historyCount; i++) {
+  int idx = (historyHead - 1 - i + MAX_HISTORY) % MAX_HISTORY;
+
+  if (history[idx].qty > 0) {
+    h += String(history[idx].user) + " bought " +
+         String(history[idx].item) + " (" +
+         String(history[idx].qty) + "g)<br>";
+  }
+}
+  h += "</div></div>";
+
+  h += "<br><a href='/login'>Logout</a>";
+  h += "</div></body></html>";
+  return h;
+}
+
+String userPage(String name) {
+  float bal = 0;
+  if (name == "KEERTHANA") bal = balanceKEERTHANA;
+  else if (name == "KISHORE") bal = balanceKISHORE;
+  else if (name == "KARTHIK") bal = balanceKARTHIK;
+
+String h = "<!DOCTYPE html><html><head>";
+h += "<meta charset='UTF-8'>";
+h += "<meta name='viewport' content='width=device-width, initial-scale=1'>";  h += "<style>";
+  h += "body{margin:0;font-family:Arial,Helvetica;background:#eef2f7;color:#222;}";
+  h += ".wrap{max-width:600px;margin:auto;padding:16px;}";
+  h += ".card{background:#fff;border-radius:16px;padding:18px;margin-bottom:14px;box-shadow:0 6px 18px rgba(0,0,0,0.08);}";
+  h += ".name{font-size:20px;font-weight:bold;}";
+  h += ".bal{font-size:34px;font-weight:800;margin:8px 0;}";
+  h += ".ok{color:#16a34a;} .low{color:#f59e0b;} .bad{color:#dc2626;}";
+  h += ".warn{background:#fee2e2;color:#991b1b;padding:10px;border-radius:10px;margin-top:10px;font-size:14px;}";
+  h += ".row{padding:8px 0;border-bottom:1px solid #eee;font-size:14px;}";
+  h += "</style></head><body>";
+
+  h += "<div class='wrap'>";
+  h += "<div class='card'>";
+  h += "<div class='name'>Welcome, " + name + "</div>";
+
+  if (bal > 50)      h += "<div class='bal ok'>₹" + String(bal, 2) + "</div>";
+  else if (bal > 20) h += "<div class='bal low'>₹" + String(bal, 2) + "</div>";
+  else               h += "<div class='bal bad'>₹" + String(bal, 2) + "</div>";
+
+  h += "<div>Available Balance</div>";
+
+  if (bal < 20) {
+    h += "<div class='warn'>⚠ Low balance! Please recharge your wallet.</div>";
+  }
+
+  h += "</div>";
+
+  h += "<div class='card'><h3>Your Recent Purchases</h3>";
+  bool found = false;
+  for (int i = 0; i < historyCount; i++) {
+  int idx = (historyHead - 1 - i + MAX_HISTORY) % MAX_HISTORY;
+  if (String(history[idx].user) == name) {
+    h += "<div class='row'>" + String(history[idx].item) + " • " + String(history[idx].qty) + "g</div>";
+    found = true;
+  }
+}
+  if (!found) h += "<div class='row'>No purchases yet</div>";
+  h += "</div>";
+
+  h += "<a href='/login'>Logout</a>";
+  h += "</div></body></html>";
+  return h;
+}
+
+/* -------- Handlers -------- */
+void handleLoginPage() {
+  server.send(200, "text/html; charset=UTF-8", loginPage());
+}
+
+void handleLogin() {
+  String p = server.arg("password");
+
+  if (p == ADMIN_LOGIN) server.sendHeader("Location", "/admin");
+  else if (p == USER1_LOGIN) server.sendHeader("Location", "/user?name=KARTHIK");
+  else if (p == USER2_LOGIN) server.sendHeader("Location", "/user?name=KEERTHANA");
+  else if (p == USER3_LOGIN) server.sendHeader("Location", "/user?name=KISHORE");
+  else {
+    server.send(200, "text/html", "Wrong Password <a href='/login'>Back</a>");
+    return;
+  }
+  server.send(303);
+}
+
+void loadFromEEPROM() {
+  EEPROM.get(ADDR_BAL_KEERTHANA, balanceKEERTHANA);
+  EEPROM.get(ADDR_BAL_KISHORE, balanceKISHORE);
+  EEPROM.get(ADDR_BAL_KARTHIK, balanceKARTHIK);
+
+  EEPROM.get(ADDR_RICE_TOTAL, riceStockTotal);
+  EEPROM.get(ADDR_DALL_TOTAL, dallStockTotal);
+  EEPROM.get(ADDR_SUGAR_TOTAL, sugarStockTotal);
+
+  EEPROM.get(ADDR_RICE_REMAIN, riceStockRemaining);
+  EEPROM.get(ADDR_DALL_REMAIN, dallStockRemaining);
+  EEPROM.get(ADDR_SUGAR_REMAIN, sugarStockRemaining);
+
+  EEPROM.get(ADDR_RICE_PRICE, ricePrice);
+  EEPROM.get(ADDR_DALL_PRICE, dallPrice);
+  EEPROM.get(ADDR_SUGAR_PRICE, sugarPrice);
+
+  Serial.println("✅ EEPROM data loaded");
+}
+
+void saveToEEPROM() {
+  EEPROM.put(ADDR_BAL_KEERTHANA, balanceKEERTHANA);
+  EEPROM.put(ADDR_BAL_KISHORE, balanceKISHORE);
+  EEPROM.put(ADDR_BAL_KARTHIK, balanceKARTHIK);
+
+  EEPROM.put(ADDR_RICE_TOTAL, riceStockTotal);
+  EEPROM.put(ADDR_DALL_TOTAL, dallStockTotal);
+  EEPROM.put(ADDR_SUGAR_TOTAL, sugarStockTotal);
+
+  EEPROM.put(ADDR_RICE_REMAIN, riceStockRemaining);
+  EEPROM.put(ADDR_DALL_REMAIN, dallStockRemaining);
+  EEPROM.put(ADDR_SUGAR_REMAIN, sugarStockRemaining);
+
+  EEPROM.put(ADDR_RICE_PRICE, ricePrice);
+  EEPROM.put(ADDR_DALL_PRICE, dallPrice);
+  EEPROM.put(ADDR_SUGAR_PRICE, sugarPrice);
+
+  EEPROM.commit();  // VERY IMPORTANT for ESP32
+  Serial.println("💾 EEPROM saved");
+}
+
+void saveHistoryToEEPROM() {
+  EEPROM.put(ADDR_HISTORY_HEAD, historyHead);
+  EEPROM.put(ADDR_HISTORY_COUNT, historyCount);
+
+  for (int i = 0; i < MAX_HISTORY; i++) {
+    int addr = ADDR_HISTORY_BASE + (i * HISTORY_RECORD_SIZE);
+    EEPROM.put(addr, history[i]);
+  }
+
+  EEPROM.commit();
+  Serial.println("💾 History saved to EEPROM");
+}
+
+void loadHistoryFromEEPROM() {
+  EEPROM.get(ADDR_HISTORY_HEAD, historyHead);
+  EEPROM.get(ADDR_HISTORY_COUNT, historyCount);
+
+  if (historyHead < 0 || historyHead >= MAX_HISTORY) historyHead = 0;
+  if (historyCount < 0 || historyCount > MAX_HISTORY) historyCount = 0;
+
+  for (int i = 0; i < MAX_HISTORY; i++) {
+    int addr = ADDR_HISTORY_BASE + (i * HISTORY_RECORD_SIZE);
+    EEPROM.get(addr, history[i]);
+
+    // safety cleanup
+    if (history[i].qty < 0 || history[i].qty > 50000) {
+      history[i].qty = 0;
+      strcpy(history[i].user, "");
+      strcpy(history[i].item, "");
+    }
+  }
+  Serial.print("History Count: ");
+  Serial.println(historyCount);
+  Serial.println("✅ History loaded safely");
+}
+
+void clearHistoryEEPROM() {
+  historyHead = 0;
+  historyCount = 0;
+
+  for (int i = 0; i < MAX_HISTORY; i++) {
+    history[i].qty = 0;
+    strcpy(history[i].user, "");
+    strcpy(history[i].item, "");
+
+    int addr = ADDR_HISTORY_BASE + (i * HISTORY_RECORD_SIZE);
+    EEPROM.put(addr, history[i]);
+  }
+
+  EEPROM.put(ADDR_HISTORY_HEAD, historyHead);
+  EEPROM.put(ADDR_HISTORY_COUNT, historyCount);
+  EEPROM.commit();
+
+  Serial.println("🧹 History EEPROM cleared");
+}
+
+void handleAdmin() { server.send(200, "text/html; charset=UTF-8", adminPage()); }
+void handleUser()  { server.send(200, "text/html; charset=UTF-8", userPage(server.arg("name")));}
+
+void handleUpdate() {
+  ricePrice = server.arg("rice").toFloat();
+  dallPrice = server.arg("dall").toFloat();
+  sugarPrice = server.arg("sugar").toFloat();
+
+  saveToEEPROM();
+  server.sendHeader("Location", "/admin"); 
+  server.send(303);
+}
+
+void handleStockUpdate() {
+  riceStockTotal = server.arg("riceStock").toInt();
+  dallStockTotal = server.arg("dallStock").toInt();
+  sugarStockTotal = server.arg("sugarStock").toInt();
+
+  riceStockRemaining = riceStockTotal;
+  dallStockRemaining = dallStockTotal;
+  sugarStockRemaining = sugarStockTotal;
+
+  saveToEEPROM();
+  server.sendHeader("Location", "/admin"); 
+  server.send(303);
+}
+
+void handleWalletUpdate() {
+  balanceKEERTHANA = server.arg("keerthana").toFloat();
+  balanceKISHORE = server.arg("kishore").toFloat();
+  balanceKARTHIK = server.arg("karthik").toFloat();
+  saveToEEPROM();
+  server.sendHeader("Location", "/admin"); 
+  server.send(303);
+}
+
+
+void waitForNetwork() {
+  gsmReady = false;
+
+  Serial.println("⏳ Waiting for GSM network...");
+  unsigned long start = millis();
+
+  while (millis() - start < 40000) {
+    gsm.println("AT+CREG?");
+    delay(1500);
+
+    String resp = "";
+    while (gsm.available()) resp += char(gsm.read());
+
+    Serial.println(resp);
+
+    if (resp.indexOf("+CREG: 1") != -1 || resp.indexOf("+CREG: 5") != -1) {
+      Serial.println("✅ GSM Network Registered!");
+      gsmReady = true;
+      return;
+    }
+  }
+
+  Serial.println("❌ GSM Network not found (timeout)");
+}
+
+void readGSM(unsigned long timeout = 3000) {
+  unsigned long t = millis();
+  while (millis() - t < timeout) {
+    while (gsm.available()) {
+      Serial.write(gsm.read());
+    }
+  }
+}
+
+void sendSMS(const char* number, String message)
+{
+  // Set SMS text mode
+  gsm.println("AT+CMGF=1");
+  delay(1000);
+
+  // Send number
+  gsm.print("AT+CMGS=\"");
+  gsm.print(number);
+  gsm.println("\"");
+
+  // 🔹 WAIT FOR '>' PROMPT
+  bool prompt = false;
+  unsigned long t = millis();
+
+  while (millis() - t < 5000) {
+    if (gsm.available()) {
+      char c = gsm.read();
+      if (c == '>') {
+        prompt = true;
+        break;
+      }
+    }
+  }
+
+  if (!prompt) {
+    Serial.println("❌ GSM prompt not received");
+    return;
+  }
+
+  // 🔹 Send message ONLY ONCE
+  gsm.print(message);
+  delay(500);
+
+  gsm.write(26);   // CTRL+Z to send
+  Serial.println("📤 Sending SMS...");
+
+  // Wait for response
+  readGSM(8000);
+
+  Serial.println("✅ SMS Process Completed");
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial1.begin(9600, SERIAL_8N1, UART1_RX, UART1_TX);
+  SPI.begin(18, 19, 23, SS_PIN);
+  mfrc522.PCD_Init();
+
+  EEPROM.begin(EEPROM_SIZE);
+  loadFromEEPROM();
+  loadHistoryFromEEPROM();
+  //clearHistoryEEPROM();   // RUN ONLY ONE TIME, then remove
+
+  WiFi.softAP(ap_ssid, ap_password);
+
+server.on("/", HTTP_GET, []() {
+  server.sendHeader("Location", "/login");
+  server.send(303);
+});
+
+server.on("/login", HTTP_GET, handleLoginPage);
+server.on("/login", HTTP_POST, handleLogin);
+server.on("/admin", handleAdmin);
+server.on("/user", handleUser);
+server.on("/update", HTTP_POST, handleUpdate);
+server.on("/stock", HTTP_POST, handleStockUpdate);
+server.on("/wallet", HTTP_POST, handleWalletUpdate);
+
+server.begin();
+
+  gsm.begin(9600, SERIAL_8N1, GSM_RX, GSM_TX);
+  delay(10000);   // let SIM initialize
+
+  gsm.println("AT");
+  delay(1000);
+
+  waitForNetwork();
+
+  if (gsmReady) {
+  server.stop();
+  sendSMS(KISHORE_NUMBER, "BOOT OK: GSM is working");
+  server.begin();
+}
+
+}
+
+void loop() {
+  server.handleClient();
+
+  if (!mfrc522.PICC_IsNewCardPresent()) return;
+  if (!mfrc522.PICC_ReadCardSerial()) return;
+
+  uidString = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) 
+  {
+    if (mfrc522.uid.uidByte[i] < 0x10) uidString += "0";
+    uidString += String(mfrc522.uid.uidByte[i], HEX);
+    uidString += " ";
+  }
+  uidString.toUpperCase();
+
+  if (uidString == "23 37 7B 38 ") customerName = "KEERTHANA";
+  else if (uidString == "44 DF 51 2E ") customerName = "KARTHIK";
+  else if (uidString == "23 8F 34 15 ") customerName = "KISHORE";
+  else customerName = "UNKNOWN";
+
+  Serial.println("\n==============================");
+  Serial.println("🪪 RFID Detected: " + uidString);
+  Serial.println("👤 Customer: " + customerName);
+  if (customerName == "UNKNOWN") {
+  Serial.println("❌ Unknown Card - Access Denied");
+  Serial.println("==============================\n");
+  mfrc522.PICC_HaltA();
+  delay(3000);
+  return;
+}
+
+    // 🔒 Reject if balance already negative (DO NOT start weighing)
+  float currentBalance = 0;
+
+  if (customerName == "KEERTHANA") currentBalance = balanceKEERTHANA;
+  else if (customerName == "KISHORE") currentBalance = balanceKISHORE;
+  else if (customerName == "KARTHIK") currentBalance = balanceKARTHIK;
+
+  if (currentBalance < 0) {
+    Serial.println("❌ Purchase Blocked: Negative Balance");
+    Serial.println("💳 Current Balance: ₹" + String(currentBalance, 2));
+    Serial.println("🚫 Weighing module NOT started");
+    Serial.println("==============================\n");
+
+    mfrc522.PICC_HaltA();   // stop RFID
+    delay(3000);
+    return;                // exit loop → START will NOT be sent
+  }
+
+/* -------- Clear UART Buffer -------- */
+while (Serial1.available())
+  Serial1.read();
+
+delay(100);
+
+/* -------- Send START -------- */
+Serial1.println("START");
+Serial.println("START sent");
+Serial.println("Waiting for ACK...");
+
+/* -------- Wait for ACK -------- */
+bool ackReceived = false;
+unsigned long ackStart = millis();
+
+while (millis() - ackStart < 5000)
+{
+  if (Serial1.available())
+  {
+    String ackLine = Serial1.readStringUntil('\n');
+    ackLine.trim();
+
+    Serial.println("UART ACK Raw: " + ackLine);
+
+    if (ackLine == "k")
+    {
+      ackReceived = true;
+      break;
+    }
+  }
+}
+
+if (!ackReceived)
+{
+  Serial.println("❌ ACK not received. Cancelling transaction.");
+  mfrc522.PICC_HaltA();
+  delay(2000);
+  return;
+}
+
+Serial.println("✅ ACK received. Waiting for item data...");
+
+
+/* -------- Wait for ITEM,QUANTITY -------- */
+bool validData = false;
+unsigned long dataStart = millis();
+rxData = "";
+
+while (millis() - dataStart < 100000)
+{
+  if (Serial1.available())
+  {
+    rxData = Serial1.readStringUntil('\n');
+    rxData = cleanString(rxData);
+
+    Serial.println("UART Data Raw: " + rxData);
+
+    if (rxData.indexOf(',') > 0)
+    {
+      validData = true;
+      break;
+    }
+  }
+}
+
+if (!validData)
+{
+  Serial.println("❌ No valid item data received.");
+  mfrc522.PICC_HaltA();
+  delay(2000);
+  return;
+}
+
+/* -------- Parse -------- */
+int c = rxData.indexOf(',');
+item = rxData.substring(0, c);
+int qty = rxData.substring(c + 1).toInt();
+
+item.trim();
+item.toUpperCase();
+
+/* -------- Validate Item -------- */
+if (item != "RICE" && item != "DALL" && item != "SUGAR")
+{
+  Serial.println("❌ Invalid item received!");
+  mfrc522.PICC_HaltA();
+  delay(2000);
+  return;
+}
+
+  float pricePerGram = (item == "RICE") ? ricePrice : (item == "DALL") ? dallPrice : sugarPrice;
+  float totalPrice = qty * pricePerGram;
+
+  Serial.println("🛒 Item: " + item);
+  Serial.println("⚖ Quantity: " + String(qty) + " g");
+  Serial.println("💰 Price per gram: ₹" + String(pricePerGram, 2));
+  Serial.println("💵 Total Bill: ₹" + String(totalPrice, 2));
+
+  if (customerName == "KEERTHANA") {
+    Serial.println("💳 Balance Before (KEERTHANA): ₹" + String(balanceKEERTHANA, 2));
+    balanceKEERTHANA -= totalPrice;
+    Serial.println("💳 Balance After  (KEERTHANA): ₹" + String(balanceKEERTHANA, 2));
+  }
+  else if (customerName == "KISHORE") {
+    Serial.println("💳 Balance Before (KISHORE): ₹" + String(balanceKISHORE, 2));
+    balanceKISHORE -= totalPrice;
+    Serial.println("💳 Balance After  (KISHORE): ₹" + String(balanceKISHORE, 2));
+  }
+  else if (customerName == "KARTHIK") {
+    Serial.println("💳 Balance Before (KARTHIK): ₹" + String(balanceKARTHIK, 2));
+    balanceKARTHIK -= totalPrice;
+    Serial.println("💳 Balance After  (KARTHIK): ₹" + String(balanceKARTHIK, 2));
+  }
+
+  if (item == "RICE") riceStockRemaining -= qty;
+  else if (item == "DALL") dallStockRemaining -= qty;
+  else if (item == "SUGAR") sugarStockRemaining -= qty;
+
+  Serial.println("📦 Stock Remaining → Rice: " + String(riceStockRemaining) +
+                 " g, Dall: " + String(dallStockRemaining) +
+                 " g, Sugar: " + String(sugarStockRemaining) + " g");
+
+  // ✅ Save purchase to circular history buffer
+strncpy(history[historyHead].user, customerName.c_str(), sizeof(history[historyHead].user) - 1);
+history[historyHead].user[sizeof(history[historyHead].user) - 1] = '\0';
+
+strncpy(history[historyHead].item, item.c_str(), sizeof(history[historyHead].item) - 1);
+history[historyHead].item[sizeof(history[historyHead].item) - 1] = '\0';
+
+history[historyHead].qty = qty;
+
+// move head forward (FIFO)
+historyHead = (historyHead + 1) % MAX_HISTORY;
+
+// keep count within limit
+if (historyCount < MAX_HISTORY) historyCount++;
+
+  Serial.println("✅ Transaction Completed");
+  Serial.println("==============================\n");
+  String sms =
+  "Customer: " + customerName + "\n" +
+  "Item: " + item + "\n" +
+  "Quantity: " + String(qty) + " g\n" +
+  "Price per gram: " + String(pricePerGram, 2) + "\n" +
+  "Total Bill: " + String(totalPrice, 2) + "\n";
+
+/*if (customerName == "KEERTHANA") {
+  sms += "Balance Before: " + String(balanceKEERTHANA + totalPrice, 2) + "\n";
+  sms += "Balance After: " + String(balanceKEERTHANA, 2) + "\n";
+  sms += "Transaction Completed";
+
+waitForNetwork();
+if (gsmReady) {
+  server.stop();
+  sendSMS(KEERTHANA_NUMBER, sms);
+  server.begin();
+} else {
+  Serial.println("⚠ GSM not ready, SMS skipped");
+}
+
+}
+else if (customerName == "KISHORE") {
+  sms += "Balance Before: " + String(balanceKISHORE + totalPrice, 2) + "\n";
+  sms += "Balance After: " + String(balanceKISHORE, 2) + "\n";
+  sms += "Transaction Completed";
+
+  server.stop();
+
+  waitForNetwork();   // ALWAYS check network
+
+  if (gsmReady) {
+    sendSMS(KISHORE_NUMBER, sms);
+  }
+
+  server.begin();
+}
+
+else if (customerName == "KARTHIK") {
+  sms += "Balance Before: " + String(balanceKARTHIK + totalPrice, 2) + "\n";
+  sms += "Balance After: " + String(balanceKARTHIK, 2) + "\n";
+  sms += "Transaction Completed";
+
+waitForNetwork();
+if (gsmReady) {
+    server.stop();
+    sendSMS(KARTHIK_NUMBER, sms);
+    server.begin();
+  }
+}*/
+
+const char* number = "";
+
+float balanceBefore = 0;
+float balanceAfter = 0;
+
+if (customerName == "KEERTHANA") {
+  number = KEERTHANA_NUMBER;
+  balanceBefore = balanceKEERTHANA + totalPrice;
+  balanceAfter = balanceKEERTHANA;
+}
+else if (customerName == "KISHORE") {
+  number = KISHORE_NUMBER;
+  balanceBefore = balanceKISHORE + totalPrice;
+  balanceAfter = balanceKISHORE;
+}
+else if (customerName == "KARTHIK") {
+  number = KARTHIK_NUMBER;
+  balanceBefore = balanceKARTHIK + totalPrice;
+  balanceAfter = balanceKARTHIK;
+}
+
+sms += "Balance Before: " + String(balanceBefore, 2) + "\n";
+sms += "Balance After: " + String(balanceAfter, 2) + "\n";
+sms += "Transaction Completed";
+
+waitForNetwork();
+
+if (gsmReady) {
+  server.stop();
+  sendSMS(number, sms);
+  server.begin();
+}
+else {
+  Serial.println("⚠ GSM not ready, SMS skipped");
+}
+
+  saveToEEPROM();
+  saveHistoryToEEPROM();
+
+  mfrc522.PICC_HaltA();
+  delay(3000);
+}
